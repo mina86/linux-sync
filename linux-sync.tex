@@ -1,0 +1,653 @@
+\documentclass[12pt]{beamer}
+\usepackage{polski}
+\usepackage[utf8]{inputenc}
+\usepackage{listings}
+
+
+\newcommand{\code}[2]{
+  \begin{block}{#1}
+    \lstinputlisting{code/#2.c}
+  \end{block}
+}
+
+\newcommand{\codepart}[3]{
+  \begin{block}{#1}
+    \lstinputlisting[linerange=#3]{code/#2.c}
+  \end{block}
+}
+
+\newcommand{\columnscode}[4]{
+  \begin{block}{#1}
+    \begin{columns}[c]
+      \column{.45\textwidth}
+      \lstinputlisting[linerange=#3]{code/#2.c}
+      \column{.45\textwidth}
+      \lstinputlisting[linerange=#4]{code/#2.c}
+    \end{columns}
+  \end{block}
+}
+
+\newcommand{\vv}[1]{\textcolor{blue}{#1}}
+\newcommand{\sv}[1]{\vv{\small #1}}
+\newcommand{\pv}[1]{\small (\vv{#1})}
+
+
+\usetheme{Frankfurt}
+\setbeamertemplate{headline}{%
+  \begin{beamercolorbox}{section in head/foot}
+    \vskip2pt\insertnavigation{\paperwidth}\vskip2pt
+  \end{beamercolorbox}%
+}
+\setbeamertemplate{navigation symbols}{}
+
+
+\lstset{
+  language=C,
+  emptylines=1, showlines=false,
+  basicstyle=\scriptsize,
+%  numbers=left, numberstyle=\scriptsize, numbersep=5pt, numberblanklines=false,
+  columns=flexible,
+  showstringspaces=false, tabsize=4,
+  breaklines=true, breakatwhitespace=true, breakautoindent,
+  literate=--1
+}
+
+
+\title{Synchronizacja w~jądrze Linux}
+\author{Michał Nazarewicz}
+\institute{Instytut Informatyki Politechniki Warszawskiej}
+
+
+\begin{document}
+
+\frame{\titlepage}
+
+\frame{\tableofcontents}
+
+
+\section{Wstęp} %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+\subsection{Po co synchronizować?}
+
+\frame{
+  \frametitle{Po co synchronizować?}
+
+  \begin{itemize}
+  \item Systemy z~wieloma procesorami stają się powszechne.
+  \item Współbieżność pozwala lepiej wykorzystać zasoby sprzętu.
+  \item Stosowanie wątków może uprościś logikę aplikacji.
+    \begin{itemize}
+    \item Jest to prawdziwe również w~jądrze.
+    \end{itemize}
+  \item Jeżeli wiele jednostek wykonania operuje na tych samym danych
+    potrzebna jest synchronizacja.
+  \end{itemize}
+
+  \pause
+
+  \begin{block}{Wyścig}
+    Sytuacja, w której co najmniej dwa logiczne konkteksty wykonania
+    (procesy, zadania itp.) wykonują operację na zasobach dzielonych,
+    a ostateczny wynik zależy od momentu realizacji.
+
+    \rightline{\small za dr.\ Krukiem}
+  \end{block}
+}
+
+\frame{
+  \frametitle{Po co synchronizować?, kont.}
+
+  \begin{block}{Inkrementacja licznika}
+    \begin{center}
+      \begin{tabular}{l|l}
+        {\bf Wątek 1} & {\bf Wątek 2} \\ \hline
+        rejestr $\leftarrow$ licznik     & \\
+        rejestr $\leftarrow$ rejestr + 1 & rejestr $\leftarrow$ licznik \\
+        licznik $\leftarrow$ rejestr     & rejestr $\leftarrow$ rejestr + 1 \\
+                                         & licznik $\leftarrow$ rejestr \\
+      \end{tabular}
+    \end{center}
+  \end{block}
+
+  \pause
+
+  \begin{block}{Ogólny schemat odczyt-modyfikacja-zapis}
+    \begin{center}
+      \begin{tabular}{l|l}
+        {\bf Wątek 1} & {\bf Wątek 2} \\ \hline
+        odczyt      & \\
+        modyfikacja & odczyt \\
+        zapis       & modyfikacja \\
+                    & zapis \\
+      \end{tabular}
+    \end{center}
+  \end{block}
+}
+
+
+\subsection{Synchronizacja w~kontekście jądra?}
+
+\frame{
+  \frametitle{Synchronizacja w~kontekście jądra?}
+
+  \begin{itemize}
+  \item W~przestrzeni użytkownika też synchronizujemy.
+  \item To już wszystko było!
+  \item Ale\ldots
+  \end{itemize}
+
+  \begin{itemize}
+  \item Każdy cykl zegara spędzony w~jądrze to cykl stracony.
+  \item Jednocześnie wszyscy korzystają z~usług jądra.
+  \item Stąd bardzo duży nacisk na wydajność.
+  \end{itemize}
+
+  \begin{itemize}
+  \item Jądro pracuje w~wielu kontekstach.
+  \item Przerwania przychodzą w~dowolnym momencie.
+  \item Jest wiele poziomów przerwań.
+  \end{itemize}
+}
+
+
+\section{Mechanizmy nieblokujące} %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\frame{
+  \frametitle{Mechanizmy nieblokujące}
+
+  \begin{itemize}
+  \item Tradycyjna sekcja krytyczna zmusza wątki na czekanie przy
+    wchodzeniu.
+  \item Czekanie to\ldots{} strata czasu.
+  \item Lepiej nie czekać, niż czekać.
+  \item Wiele algorytmów można zrealizować korzystając z~,,lekkich''
+    mechanizmów synchronizacji, które nie blokują kontekstu wykonania.
+  \end{itemize}
+}
+
+
+\subsection{Brak synchronizacji i~bariery pamięci}
+
+\frame{
+  \frametitle{Kiedy nie synchronizować?}
+
+  \begin{itemize}
+  \item Istnieje duży nacisk na wydajność jądra.
+  \item Dlatego niektóre operacje nie są synchronizowane.
+  \item System zakłada, że jest to powinność użytkownika.
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Kiedy nie synchronizować?, kod}
+  \code{Wywołanie systemowe {\tt read(2)}}{read}
+}
+
+\frame{
+  \frametitle{Bufor cykliczny}
+
+  \begin{itemize}
+  \item Jeden producent.
+  \item Jeden konsument.
+  \item Jak obsługa klawiatury w~DOS-ie.
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Bufor cykliczny, kod}
+
+  \codepart{Bufor cykliczny, dane}{cyclic}{1-2}
+  \columnscode{Bufor cykliczny, funkcje}{cyclic}{10-19}{20-29}
+}
+
+\frame{
+  \frametitle{Bariery pamięci}
+
+  \begin{itemize}
+  \item Procesor może przestawiać operacje zapisu i~odczytu.
+  \item Procesor może postrzegać operacje w~losowej kolejności.
+  \item Bariery wymuszają częściowy porządek operacji.
+  \end{itemize}
+
+  \pause
+
+  \columnscode{Bufor cykliczny, poprawiony}{cyclic}{30-39}{40-49}
+}
+
+\frame{
+  \frametitle{Bariery pamięci, kont.}
+
+  \code{{\bf Niepoprawny} wielowątkowy singleton}{invalid-singleton}
+}
+
+
+\subsection{Zmienne atomowe i~licznik referencji}
+
+\frame{
+  \frametitle{Zmienne atomowe}
+
+  \begin{itemize}
+  \item Linux wyposażony jest w~zmienne atomowe \pv{atomic\_t}.
+  \item Operacja na zmiennych atomowych są\ldots{} atomowe.
+  \end{itemize}
+
+  \begin{block}{Dostępne operacje na zmiennych atomowych}
+    \begin{center}
+      \begin{tabular}{lll}
+        \vv{atomic\_set} & \vv{atomic\_read} & \\
+        \hline
+        \vv{atomic\_add} & \vv{atomic\_add\_return} & \vv{atomic\_add\_negative} \\
+        \vv{atomic\_sub} & \vv{atomic\_sub\_return} & \vv{atomic\_sub\_and\_test} \\
+        \vv{atomic\_inc} & \vv{atomic\_inc\_return} & \vv{atomic\_inc\_and\_test} \\
+        \vv{atomic\_dec} & \vv{atomic\_dec\_return} & \vv{atomic\_dec\_and\_test} \\
+        \hline
+        & \vv{atomic\_add\_unless} & \vv{atomic\_inc\_not\_zero} \\
+        \hline
+        & \vv{atomic\_xchg} & \vv{atomic\_cmpxchg} \\
+      \end{tabular}
+    \end{center}
+  \end{block}
+}
+
+\frame{
+  \frametitle{Licznik referencji}
+
+  \begin{itemize}
+  \item W~oparciu o~zmienne atomowe zaimplementowany jest licznik
+    referencji \pv{struct kref}.
+  \item Dostępne operacje:
+    \begin{itemize}
+    \item \vv{kref\_set},
+    \item \vv{kref\_init},
+    \item \vv{kref\_get} oraz
+    \item \vv{kref\_put}.
+    \end{itemize}
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Licznik referencji, kod}
+
+  \columnscode{Obiekt współdzielony}{kref}{1-12}{14-27}
+}
+
+\frame{
+  \lstset{basicstyle=\tiny}
+  \code{Zmienne atomowe w~przestrzeni użytkownika}{string-ref}
+  \lstset{basicstyle=\scriptsize}
+}
+
+
+\subsection{Operacje na bitach}
+
+\frame{
+  \frametitle{Operacje na bitach}
+
+  \begin{itemize}
+  \item Podobnym mechanizmem są atomowe operacja na bitach.
+  \item Nadają się idealnie, jeżeli chcemy wykonać coś raz.
+  \end{itemize}
+
+  \begin{block}{Dostępne operacje na bitach}
+    \begin{center}
+      \begin{tabular}{ll}
+        \vv{set\_bit} & \vv{test\_and\_set\_bit} \\
+        \vv{clear\_bit} & \vv{test\_and\_clear\_bit} \\
+        \vv{change\_bit} & \vv{test\_and\_change\_bit} \\
+      \end{tabular}
+    \end{center}
+  \end{block}
+}
+
+\frame{
+  \frametitle{Operacje na bitach, kod}
+
+  \code{Tasklety}{tasklets}
+}
+
+
+\subsection{Porównaj i~zamień}
+
+\frame{
+  \frametitle{Porównaj i~zamień}
+
+  \begin{block}{Atomowe operacje porównaj i~zamień}
+    \begin{center}
+      \begin{tabular}{ll}
+        \vv{xchg}    & \vv{atomic\_xchg} \\
+        \vv{cmpxchg} & \vv{atomic\_cmpxchg} \\
+      \end{tabular}
+    \end{center}
+  \end{block}
+
+  \pause
+
+  \columnscode{Operacje na stosie}{stack}{1-9}{11-18}
+}
+
+
+\section{,,Śpiące'' mechanizmy blokujące} %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\frame{
+  \frametitle{Mechanizmy blokujące}
+
+  \begin{itemize}
+  \item Proste atomowe operacje często nie wystarczają.
+  \item Zazwyczaj trzeba modyfikować wiele zmiennych ,,na raz''.
+  \item Często trzeba również czekać na wystąpienie pewnych warunków.
+  \item W~takich sytuacjach sprawdzają się mechanizmy blokujące.
+  \end{itemize}
+}
+
+
+\subsection{Kolejka oczekiwania}
+
+\frame{
+  \frametitle{Kolejka oczekiwania}
+
+  \begin{itemize}
+  \item Podstawowym mechanizmem blokującym jest kolejka oczekiwania
+    \pv{wait\_queue\_head\_t}, która
+  \item służy do tworzenia listy, w~której zadania oczekują, aż
+  \item inne zadania je obudzą.
+  \item Zazwyczaj korzysta się z~niej poprzez interfejs
+    \vv{wait\_event} (i~warianty).
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Kolejka oczekiwania, kod}
+
+  \codepart{Blokujący bufor cykliczny, dane}{cyclic}{50-59}
+  \columnscode{Blokujący bufor cykliczny, funkcje}{cyclic}{60-69}{70-79}
+}
+
+\frame{
+  \frametitle{Spanie a~sygnały}
+
+  \begin{itemize}
+  \item Funkcja \vv{wait\_event} blokuje sygnały!
+  \item Procesu blokującego sygnały nie da się zabić!
+  \item Lepiej użyć \vv{wait\_event\_interruptible}.
+  \end{itemize}
+
+  \pause
+
+  \columnscode{Kolejka oczekiwania, wersja {\tt
+      interruptible}}{cyclic}{80-89}{90-99}
+}
+
+
+\subsection{Semafory i~muteksy}
+
+\frame{
+  \frametitle{Semafory}
+
+  \begin{itemize}
+  \item Użyty mechanizm to klasyczny semafor.
+  \item Semafory są rzecz jasna dostępne w~jądrze.
+  \item Dostępne operacje:
+    \begin{itemize}
+    \item \vv{sema\_init},
+    \item \vv{down}, \vv{down\_trylock},
+    \item \vv{down\_interruptible}, \vv{down\_killable}, \vv{down\_timeout} oraz
+    \item \vv{up}.
+    \end{itemize}
+  \end{itemize}
+
+  \begin{block}{Semafor}
+    Obiekt inicjowany nieujemną liczbą całkowitą, na której zdefiniowane
+    są dwie niepodzielne operacje:
+    \begin{itemize}
+    \item {\tt down(sem) \{ while (!sem); --sem; \}}.
+    \item {\tt up(sem) \{ ++sem; \}} i
+    \end{itemize}
+
+    \rightline{\small za dr.\ Krukiem}
+  \end{block}
+}
+
+\frame{
+  \frametitle{Semafory, kod}
+
+  \codepart{Bufor cykliczny na semaforach, dane}{cyclic}{100-109}
+  \columnscode{Bufor cykliczny na semaforach, funkcje}{cyclic}{110-119}{120-129}
+}
+
+\frame{
+  \frametitle{Muteksy}
+
+  \begin{itemize}
+  \item Pewnym szczególnym rodzajem semaforów są muteksy.
+  \item Z~założenia stworzone do implementowania sekcji krytycznej.
+  \item Dostępne operacje:
+    \begin{itemize}
+    \item \vv{mutex\_is\_locked},
+    \item \vv{mutex\_lock} i~wiarianty
+      \begin{itemize}
+      \item plus wersje \vv{\ldots\_nested},
+      \end{itemize}
+    \item \vv{mutex\_try\_lock},
+    \item \vv{mutex\_unlock}.
+    \end{itemize}
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Muteksy, kod}
+
+  \codepart{Kolejka chroniona muteksem}{queue}{10-29}
+}
+
+
+\frame{
+  \frametitle{Muteksy, ,,nested''?}
+
+  \begin{block}{Zakleszczenie}
+    Pojęcie opisujące sytuację, w której co najmniej dwie różne akcje
+    czekają na siebie nawzajem, więc żadna nie może się zakończyć.
+
+    \rightline{\small za Wikipedią}
+  \end{block}
+
+  \pause
+
+  \begin{itemize}
+  \item Linux ma mechanizm weryfikacji synchronizacji.
+  \item Dzieli muteksy itp.\ na klasy.
+  \item Sprawdza, czy klasy są blokowane w~tej samej
+    kolejności.
+  \item Nie można zablokować dwóch muteksów z~tej samej klasy.
+  \item Co w~takim razie z~muteksami w~hierarchii?
+  \item Po to jest właśnie \vv{mutex\_lock\_nested} itp.
+  \end{itemize}
+}
+
+
+\section{,,Nieśpiące'' mechanizmy blokujące} %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\frame{
+  \frametitle{,,Nieśpiące'' mechanizmy}
+
+  \begin{itemize}
+  \item Przedstawione dotychczas mechanizmy blokujące mogą przełączyć
+    zadanie w~stan uśpienia.
+  \item W~pewnych kontekstach spanie jest niedopuszczalne.
+    \begin{itemize}
+    \item Wewnątrz funkcji obsługi przerwania.
+    \item Gdy przerwania są wyłączone.
+    \item Ogólnie w~kontekście atomowym.
+    \end{itemize}
+  \item Ale na szczęście są inne mechanizmy.
+  \end{itemize}
+}
+
+\subsection{Przerwania i~wywłaszczanie}
+
+\frame{
+  \frametitle{Wyłączanie przerwań}
+
+  \begin{itemize}
+  \item Będąc w~kodzie jądra możemy wyłączyć przerwania.
+  \item \vv{local\_irq\_diable} wyłącza, a~\vv{local\_irq\_enable}
+    włącza przerwania.
+  \item Ale co jeśli w~momencie wejścia do sekcji krytycznej
+    przerwania już były wyłączone?
+  \item Na pomoc przychodzą \vv{local\_irq\_save}
+    i~\vv{local\_irq\_restore}.
+  \item Trzeba uważać -- pewne funkcje mogą spowodować przełączenie
+    kontekstu nawet jeżeli przerwania są wyłączone.
+  \item A~poza tym, wyłączanie przerwań jest lokalne dla procesora.
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Wyłączanie wywłaszczania}
+
+  \begin{itemize}
+  \item Linux wspiera wywłaszczanie wewnątrz kodu jądra.
+  \item Zmniejsza to czas reakcji, ale
+  \item komplikuje synchronizację.
+  \item Można ten mechanizm wyłączyć.
+  \item Dostępne operacje \vv{preempt\_disable}
+    i~\vv{preempt\_enable}
+  \item są rekurencyjne,
+  \item ale lokalne dla konkretnego procesora.
+  \end{itemize}
+}
+
+
+\subsection{Spinlocki}
+
+\frame{
+  \frametitle{Spinlock}
+
+  \begin{itemize}
+  \item Spinlock działa jak muteks, ale
+  \item stosuje aktywne oczekiwanie, dzięki czemu
+  \item nie zasypia.
+  \item Użycie: \vv{spin\_lock} \ldots{} \vv{spin\_unlock}.
+    \begin{itemize}
+    \item Też mają wersję \vv{\ldots\_nested}.
+    \end{itemize}
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Spinlock, kod}
+
+  \codepart{Kolejka chroniona spinlockiem}{queue}{30-49}
+}
+
+\frame{
+  \frametitle{Spinlock a~przerwania}
+
+  \begin{itemize}
+  \item Co jeśli w~sekcji krytycznej przyjdzie przerwanie?
+  \end{itemize}
+
+  \begin{block}{Przerwanie w~sekcji krytycznej}
+    \begin{center}
+      \begin{tabular}{lll}
+        {\bf Kontekst} & & \\
+        {\bf użytkownika} & & {\bf Przerwanie} \\
+        \hline
+        \vv{spin\_lock} & & \\
+        & przychodzi przerwanie & \\
+        & & \vv{spin\_lock} \\
+        & & zakleszczenie
+      \end{tabular}
+    \end{center}
+  \end{block}
+
+  \begin{itemize}
+  \item Gdy spinlock używany jest również w~przerwaniu, w~kontekście
+    użytkownika trzeba przerwania wyłączyć {\small
+      (\vv{spin\_lock\_irqsave} \ldots{}
+      \vv{spin\_unlock\_irqrestore})}.
+    \begin{itemize}
+    \item Jest też wersja \vv{spin\_lock\_irq} \ldots{}
+      \vv{spin\_unlock\_irq}
+    \end{itemize}
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Spinlock a~przerwania, kod}
+
+  \codepart{Kolejka chroniona spinlockiem, poprawiona}{queue}{50-69}
+}
+
+
+\section{Zakończenie} %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Podsumowanie}
+
+\frame{
+  \frametitle{Podsumowanie}
+
+  \begin{itemize}
+  \item Linux jest bardzo złożonym oprogramowaniem.
+  \item Wiele mechanizmów jest znanych z~przestrzeni użytkownika.
+  \item Nacisk na wydajność i~przerwania komplikują sytuację.
+  \item Dlatego jest wiele mechanizmów unikalnych dla jądra.
+  \item Czyni to synchronizację w~kernelu bardzo ciekawą!
+  \item Ale i~złożoną i~trudną.
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Czego nie było\ldots}
+
+  \begin{itemize}
+  \item Siedem rodzai barier pamięci.
+  \item Big Kernel Lock.
+  \item Kolejka oczekiwań to coś o~wiele więcej niż \vv{wait\_event}.
+  \item \vv{spin\_lock\_bh}.
+  \item Zmienne {\it per CPU}.
+  \item Alokacja pamięci a~synchronizacja.
+  \end{itemize}
+}
+
+\subsection{Źródła}
+
+\frame{
+  \frametitle{Skąd czerpać informacje?}
+
+  \begin{itemize}
+  \item Use the Source, Luke.
+  \item Podkatalog {\tt Documentation} w~źródlach.
+  \item Publiczne serwery LXR.
+    \begin{itemize}
+    \item http://lxr.linux.no/
+    \end{itemize}
+  \item LWN.net
+  \item STER z dr. W. Zabołotnym
+  \item {\it Linux Device Drivers, Third Edition}
+    \begin{itemize}
+    \item http://lwn.net/Kernel/LDD3/
+    \end{itemize}
+  \item Daniel P. Bovet, Marco Cesati. {\it Understanding the Linux
+    Kernel}.
+  \end{itemize}
+}
+
+\frame{
+  \frametitle{Dziękuję za uwagę!}
+
+  \begin{itemize}
+  \item Pytania?
+  \item Opinie?
+  \item Sugestie?
+  \end{itemize}
+
+  \begin{itemize}
+  \item \insertauthor
+  \item http://mina86.com/
+  \item mina86@mina86.com
+  \item mina86@jabber.org
+  \end{itemize}
+}
+
+\end{document}
